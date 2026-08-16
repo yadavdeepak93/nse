@@ -18,7 +18,7 @@ st.set_page_config(
 # SETTINGS & DATA CONSTANTS
 # ============================================================
 STRIKES_EACH_SIDE = 5
-MAX_WORKERS = 8  # Exactly 3 parallel threads as requested
+MAX_WORKERS = 3  # Safely restricted to 3 parallel threads
 
 STOCKS = [
     "360ONE", "ABB", "ABCAPITAL", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ALKEM", "AMBER", 
@@ -92,67 +92,81 @@ def create_nse_session():
 def fetch_single_stock(symbol, timestamp):
     session = create_nse_session()
     rows = []
-    try:
-        res = session.get("https://www.nseindia.com/api/option-chain-contract-info", params={"symbol": symbol}, timeout=8)
-        expiries = res.json().get("expiryDates", [])
-        if not expiries:
-            return rows
-        expiry = expiries[0]
-        
-        lot_size = LOT_SIZES.get(symbol, 1)
-        
-        chain_res = session.get("https://www.nseindia.com/api/option-chain-v3", params={"type": "Equity", "symbol": symbol, "expiry": expiry}, timeout=8)
-        records = chain_res.json().get("records", {})
-        option_data = records.get("data", [])
-        if not option_data:
-            return rows
-            
-        underlying = records.get("underlyingValue")
-        if underlying is None:
-            for item in option_data:
-                ce, pe = item.get("CE", {}), item.get("PE", {})
-                underlying = ce.get("underlyingValue") or pe.get("underlyingValue")
-                if underlying is not None:
-                    break
-        if underlying is None:
-            return rows
-        underlying = float(underlying)
-        
-        strikes = sorted(set(float(x["strikePrice"]) for x in option_data if x.get("strikePrice")))
-        if not strikes:
-            return rows
-            
-        atm = min(strikes, key=lambda x: abs(x - underlying))
-        atm_index = strikes.index(atm)
-        start = max(0, atm_index - STRIKES_EACH_SIDE)
-        end = min(len(strikes), atm_index + STRIKES_EACH_SIDE + 1)
-        selected_strikes = set(strikes[start:end])
-        
-        for item in option_data:
-            strike = item.get("strikePrice")
-            if strike is None:
-                continue
-            strike = float(strike)
-            if strike not in selected_strikes:
-                continue
-            
-            ce = item.get("CE", {})
-            pe = item.get("PE", {})
-            
-            rows.append({
-                "Timestamp": timestamp,
-                "Symbol": symbol,
-                "Expiry": expiry,
-                "Underlying": underlying,
-                "ATM": atm,
-                "Strike": strike,
-                "LotSize": lot_size,
-                "CE_LTP": ce.get("lastPrice", 0.0) or 0.0,
-                "PE_LTP": pe.get("lastPrice", 0.0) or 0.0,
-            })
-    except Exception:
-        pass
+    max_retries = 3
     
+    for attempt in range(max_retries):
+        try:
+            res = session.get("https://www.nseindia.com/api/option-chain-contract-info", params={"symbol": symbol}, timeout=8)
+            if res.status_code != 200:
+                time.sleep(1)
+                continue
+                
+            expiries = res.json().get("expiryDates", [])
+            if not expiries:
+                return rows
+            expiry = expiries[0]
+            
+            lot_size = LOT_SIZES.get(symbol, 1)
+            
+            chain_res = session.get("https://www.nseindia.com/api/option-chain-v3", params={"type": "Equity", "symbol": symbol, "expiry": expiry}, timeout=8)
+            if chain_res.status_code != 200:
+                time.sleep(1)
+                continue
+                
+            records = chain_res.json().get("records", {})
+            option_data = records.get("data", [])
+            if not option_data:
+                return rows
+                
+            underlying = records.get("underlyingValue")
+            if underlying is None:
+                for item in option_data:
+                    ce, pe = item.get("CE", {}), item.get("PE", {})
+                    underlying = ce.get("underlyingValue") or pe.get("underlyingValue")
+                    if underlying is not None:
+                        break
+            if underlying is None:
+                return rows
+            underlying = float(underlying)
+            
+            strikes = sorted(set(float(x["strikePrice"]) for x in option_data if x.get("strikePrice")))
+            if not strikes:
+                return rows
+                
+            atm = min(strikes, key=lambda x: abs(x - underlying))
+            atm_index = strikes.index(atm)
+            start = max(0, atm_index - STRIKES_EACH_SIDE)
+            end = min(len(strikes), atm_index + STRIKES_EACH_SIDE + 1)
+            selected_strikes = set(strikes[start:end])
+            
+            for item in option_data:
+                strike = item.get("strikePrice")
+                if strike is None:
+                    continue
+                strike = float(strike)
+                if strike not in selected_strikes:
+                    continue
+                
+                ce = item.get("CE", {})
+                pe = item.get("PE", {})
+                
+                rows.append({
+                    "Timestamp": timestamp,
+                    "Symbol": symbol,
+                    "Expiry": expiry,
+                    "Underlying": underlying,
+                    "ATM": atm,
+                    "Strike": strike,
+                    "LotSize": lot_size,
+                    "CE_LTP": ce.get("lastPrice", 0.0) or 0.0,
+                    "PE_LTP": pe.get("lastPrice", 0.0) or 0.0,
+                })
+            break # Success, break retry loop
+        except Exception:
+            time.sleep(1)  # Backoff before retry
+            
+    # Enforce the 1 second delay per thread execution call to ensure fail-safe stability against rate limits
+    time.sleep(1.0)
     return rows
 
 def fetch_data():
@@ -164,7 +178,6 @@ def fetch_data():
     total_stocks = len(STOCKS)
     completed = 0
 
-    # Wait for all parallel tasks to finish before compiling results
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_symbol = {executor.submit(fetch_single_stock, symbol, timestamp): symbol for symbol in STOCKS}
         
@@ -195,8 +208,8 @@ def process_options_dataframe(df):
     filtered_df = df[
         (df['ATM'] == df['Strike']) & 
         (df['CE_LTP'] != 0) & 
-        (df['PE_LTP'] != 0)
-    ].copy()
+        (df['PE_LTP'] != 0]
+    ).copy()
     
     if filtered_df.empty:
         return filtered_df
@@ -210,17 +223,16 @@ def process_options_dataframe(df):
     filtered_df['ROI_Percentage'] = ((filtered_df['Net_Final_Pnl'] / filtered_df['Total_Investment']) * 100).round(2)
     filtered_df['Annualized_ROI'] = (filtered_df['ROI_Percentage'] * 12).round(2)
     
-    # Fully compiled and sorted dataframe
     return filtered_df.sort_values(by='Net_Final_Pnl', ascending=False)
 
 # ============================================================
 # STREAMLIT USER INTERFACE
 # ============================================================
 st.title("📊 NSE F&O Options Scanner & PnL Analyzer")
-st.markdown("This tool fetches live option chains using 3 parallel workers, processes the metrics, and presents the fully sorted matrix.")
+st.markdown("This fail-safe tool fetches live option chains using 3 parallel workers with built-in retry mechanisms and rate control.")
 
 if st.button("🚀 Run Live Option Scan & Calculate PnL", type="primary"):
-    with st.spinner("Fetching data in parallel and compiling results..."):
+    with st.spinner("Fetching data safely in parallel and compiling results..."):
         raw_df = fetch_data()
         
     if raw_df.empty:
