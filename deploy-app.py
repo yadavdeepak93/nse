@@ -165,7 +165,7 @@ def fetch_single_stock(symbol, timestamp):
         except Exception:
             time.sleep(1)  # Backoff before retry
             
-    # Enforce the 1 second delay per thread execution call to ensure fail-safe stability against rate limits
+    # Enforce the 1-second delay per thread execution call to ensure fail-safe stability against rate limits
     time.sleep(1.0)
     return rows
 
@@ -208,8 +208,8 @@ def process_options_dataframe(df):
     filtered_df = df[
         (df['ATM'] == df['Strike']) & 
         (df['CE_LTP'] != 0) & 
-        (df['PE_LTP'] != 0]
-    ).copy()
+        (df['PE_LTP'] != 0)
+    ].copy()
     
     if filtered_df.empty:
         return filtered_df
