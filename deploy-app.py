@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -17,7 +18,7 @@ st.set_page_config(
 # SETTINGS & DATA CONSTANTS
 # ============================================================
 STRIKES_EACH_SIDE = 5
-DELAY = 1.0
+MAX_WORKERS = 3  # Exactly 3 parallel threads as requested
 
 STOCKS = [
     "360ONE", "ABB", "ABCAPITAL", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ALKEM", "AMBER", 
@@ -82,90 +83,102 @@ def create_nse_session():
         "X-Requested-With": "XMLHttpRequest",
     })
     try:
-        s.get("https://www.nseindia.com", timeout=15)
-        time.sleep(0.5)
-        s.get("https://www.nseindia.com/option-chain", timeout=15)
+        s.get("https://www.nseindia.com", timeout=10)
+        s.get("https://www.nseindia.com/option-chain", timeout=10)
     except Exception:
         pass
     return s
 
-def fetch_data():
+def fetch_single_stock(symbol, timestamp):
     session = create_nse_session()
+    rows = []
+    try:
+        res = session.get("https://www.nseindia.com/api/option-chain-contract-info", params={"symbol": symbol}, timeout=8)
+        expiries = res.json().get("expiryDates", [])
+        if not expiries:
+            return rows
+        expiry = expiries[0]
+        
+        lot_size = LOT_SIZES.get(symbol, 1)
+        
+        chain_res = session.get("https://www.nseindia.com/api/option-chain-v3", params={"type": "Equity", "symbol": symbol, "expiry": expiry}, timeout=8)
+        records = chain_res.json().get("records", {})
+        option_data = records.get("data", [])
+        if not option_data:
+            return rows
+            
+        underlying = records.get("underlyingValue")
+        if underlying is None:
+            for item in option_data:
+                ce, pe = item.get("CE", {}), item.get("PE", {})
+                underlying = ce.get("underlyingValue") or pe.get("underlyingValue")
+                if underlying is not None:
+                    break
+        if underlying is None:
+            return rows
+        underlying = float(underlying)
+        
+        strikes = sorted(set(float(x["strikePrice"]) for x in option_data if x.get("strikePrice")))
+        if not strikes:
+            return rows
+            
+        atm = min(strikes, key=lambda x: abs(x - underlying))
+        atm_index = strikes.index(atm)
+        start = max(0, atm_index - STRIKES_EACH_SIDE)
+        end = min(len(strikes), atm_index + STRIKES_EACH_SIDE + 1)
+        selected_strikes = set(strikes[start:end])
+        
+        for item in option_data:
+            strike = item.get("strikePrice")
+            if strike is None:
+                continue
+            strike = float(strike)
+            if strike not in selected_strikes:
+                continue
+            
+            ce = item.get("CE", {})
+            pe = item.get("PE", {})
+            
+            rows.append({
+                "Timestamp": timestamp,
+                "Symbol": symbol,
+                "Expiry": expiry,
+                "Underlying": underlying,
+                "ATM": atm,
+                "Strike": strike,
+                "LotSize": lot_size,
+                "CE_LTP": ce.get("lastPrice", 0.0) or 0.0,
+                "PE_LTP": pe.get("lastPrice", 0.0) or 0.0,
+            })
+    except Exception:
+        pass
+    
+    return rows
+
+def fetch_data():
     all_rows = []
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     total_stocks = len(STOCKS)
+    completed = 0
 
-    for i, symbol in enumerate(STOCKS):
-        status_text.text(f"Processing [{i+1}/{total_stocks}] : {symbol}...")
-        progress_bar.progress((i + 1) / total_stocks)
+    # Wait for all parallel tasks to finish before compiling results
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_symbol = {executor.submit(fetch_single_stock, symbol, timestamp): symbol for symbol in STOCKS}
         
-        try:
-            # Get Expiry
-            res = session.get("https://www.nseindia.com/api/option-chain-contract-info", params={"symbol": symbol}, timeout=10)
-            expiries = res.json().get("expiryDates", [])
-            if not expiries:
-                continue
-            expiry = expiries[0]
+        for future in as_completed(future_to_symbol):
+            completed += 1
+            progress_bar.progress(completed / total_stocks)
+            status_text.text(f"Processed [{completed}/{total_stocks}] stocks...")
             
-            lot_size = LOT_SIZES.get(symbol, 1)
-            
-            # Get Chain Data
-            chain_res = session.get("https://www.nseindia.com/api/option-chain-v3", params={"type": "Equity", "symbol": symbol, "expiry": expiry}, timeout=10)
-            records = chain_res.json().get("records", {})
-            option_data = records.get("data", [])
-            if not option_data:
-                continue
-                
-            underlying = records.get("underlyingValue")
-            if underlying is None:
-                for item in option_data:
-                    ce, pe = item.get("CE", {}), item.get("PE", {})
-                    underlying = ce.get("underlyingValue") or pe.get("underlyingValue")
-                    if underlying is not None:
-                        break
-            if underlying is None:
-                continue
-            underlying = float(underlying)
-            
-            strikes = sorted(set(float(x["strikePrice"]) for x in option_data if x.get("strikePrice")))
-            if not strikes:
-                continue
-                
-            atm = min(strikes, key=lambda x: abs(x - underlying))
-            atm_index = strikes.index(atm)
-            start = max(0, atm_index - STRIKES_EACH_SIDE)
-            end = min(len(strikes), atm_index + STRIKES_EACH_SIDE + 1)
-            selected_strikes = set(strikes[start:end])
-            
-            for item in option_data:
-                strike = item.get("strikePrice")
-                if strike is None:
-                    continue
-                strike = float(strike)
-                if strike not in selected_strikes:
-                    continue
-                
-                ce = item.get("CE", {})
-                pe = item.get("PE", {})
-                
-                all_rows.append({
-                    "Timestamp": timestamp,
-                    "Symbol": symbol,
-                    "Expiry": expiry,
-                    "Underlying": underlying,
-                    "ATM": atm,
-                    "Strike": strike,
-                    "LotSize": lot_size,
-                    "CE_LTP": ce.get("lastPrice", 0.0) or 0.0,
-                    "PE_LTP": pe.get("lastPrice", 0.0) or 0.0,
-                })
-        except Exception:
-            continue
-        
-        time.sleep(DELAY)
+            try:
+                res_rows = future.result()
+                if res_rows:
+                    all_rows.extend(res_rows)
+            except Exception:
+                pass
 
     progress_bar.empty()
     status_text.empty()
@@ -173,14 +186,12 @@ def fetch_data():
     if not all_rows:
         return pd.DataFrame()
         
-    df = pd.DataFrame(all_rows)
-    return df
+    return pd.DataFrame(all_rows)
 
 def process_options_dataframe(df):
     if df.empty:
         return df
         
-    # Apply filtering logic from Script 2
     filtered_df = df[
         (df['ATM'] == df['Strike']) & 
         (df['CE_LTP'] != 0) & 
@@ -199,17 +210,17 @@ def process_options_dataframe(df):
     filtered_df['ROI_Percentage'] = ((filtered_df['Net_Final_Pnl'] / filtered_df['Total_Investment']) * 100).round(2)
     filtered_df['Annualized_ROI'] = (filtered_df['ROI_Percentage'] * 12).round(2)
     
-    sorted_df = filtered_df.sort_values(by='Net_Final_Pnl', ascending=False)
-    return sorted_df
+    # Fully compiled and sorted dataframe
+    return filtered_df.sort_values(by='Net_Final_Pnl', ascending=False)
 
 # ============================================================
 # STREAMLIT USER INTERFACE
 # ============================================================
 st.title("📊 NSE F&O Options Scanner & PnL Analyzer")
-st.markdown("This tool fetches live option chains, filters ATM options, calculates metrics, and displays interactive results optimized for mobile/desktop viewing.")
+st.markdown("This tool fetches live option chains using 3 parallel workers, processes the metrics, and presents the fully sorted matrix.")
 
 if st.button("🚀 Run Live Option Scan & Calculate PnL", type="primary"):
-    with st.spinner("Connecting to NSE and fetching option chain rows... (This may take a minute)"):
+    with st.spinner("Fetching data in parallel and compiling results..."):
         raw_df = fetch_data()
         
     if raw_df.empty:
@@ -221,18 +232,14 @@ if st.button("🚀 Run Live Option Scan & Calculate PnL", type="primary"):
             st.warning("Data fetched, but no rows matched the ATM and non-zero LTP criteria.")
         else:
             st.success(f"Scan complete! Found {len(processed_df)} high-priority opportunities.")
-            
-            # Store in session state so it remains visible
             st.session_state['results'] = processed_df
 
-# Display results if available in session state
 if 'results' in st.session_state:
     res_df = st.session_state['results']
     
     st.subheader("📋 Processed Options Matrix")
-    st.caption("Swipe horizontally on mobile to view all calculated financial columns.")
+    st.caption("💡 Tap column headers in the table below to sort. Swipe horizontally on mobile to view all columns.")
     
-    # Custom HTML Table Styling via Pandas Styler for clear visual cues
     def color_pnl(val):
         color = 'green' if val > 0 else 'red'
         return f'color: {color}; font-weight: bold;'
@@ -255,19 +262,13 @@ if 'results' in st.session_state:
         'Annualized_ROI': '{:.2f}%'
     })
 
-    # Render table interactively with native Streamlit wide display
     st.dataframe(styled_df, use_container_width=True, height=500)
     
-    # Download Options Buttons
-    col1, col2 = st.columns(2)
-    
     csv_data = res_df.to_csv(index=False).encode('utf-8')
-    
-    with col1:
-        st.download_button(
-            label="📥 Download Final Results CSV",
-            data=csv_data,
-            file_name=f"final_processed_options_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+    st.download_button(
+        label="📥 Download Final Results as CSV",
+        data=csv_data,
+        file_name=f"final_processed_options_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
