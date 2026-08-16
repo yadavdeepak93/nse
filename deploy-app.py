@@ -18,7 +18,7 @@ st.set_page_config(
 # SETTINGS & DATA CONSTANTS
 # ============================================================
 STRIKES_EACH_SIDE = 5
-MAX_WORKERS = 3  # Exactly 3 parallel threads as requested
+MAX_WORKERS = 8  # Exactly 3 parallel threads as requested
 
 STOCKS = [
     "360ONE", "ABB", "ABCAPITAL", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ALKEM", "AMBER", 
