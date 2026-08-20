@@ -104,7 +104,7 @@ def fetch_single_stock(symbol, timestamp):
             expiries = res.json().get("expiryDates", [])
             if not expiries:
                 return rows
-            expiry = expiries[1]
+            expiry = expiries[0]
             
             lot_size = LOT_SIZES.get(symbol, 1)
             
@@ -218,7 +218,7 @@ def process_options_dataframe(df):
     filtered_df['Total_Diff_Value'] = filtered_df['LotSize'] * filtered_df['CE_PE_Diff']
     filtered_df['Gross_Final_Pnl'] = ((filtered_df['Strike'] + filtered_df['CE_LTP'] - filtered_df['PE_LTP'] - filtered_df['Underlying']) * filtered_df['LotSize'])
     filtered_df['Total_Investment'] = filtered_df['Underlying'] * filtered_df['LotSize']
-    filtered_df['Taxes_And_Brokerage'] = 1500.0
+    filtered_df['Taxes_And_Brokerage'] = 1600.0
     filtered_df['Net_Final_Pnl'] = filtered_df['Gross_Final_Pnl'] - filtered_df['Taxes_And_Brokerage']
     filtered_df['ROI_Percentage'] = ((filtered_df['Net_Final_Pnl'] / filtered_df['Total_Investment']) * 100).round(2)
     filtered_df['Annualized_ROI'] = (filtered_df['ROI_Percentage'] * 12).round(2)
