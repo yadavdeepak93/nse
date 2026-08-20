@@ -104,7 +104,7 @@ def fetch_single_stock(symbol, timestamp):
             expiries = res.json().get("expiryDates", [])
             if not expiries:
                 return rows
-            expiry = expiries[0]
+            expiry = expiries[1]
             
             lot_size = LOT_SIZES.get(symbol, 1)
             
